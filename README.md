@@ -1,6 +1,6 @@
 # Nanocode: Build Your Own AI Coding Agent
 
-This is the companion code repository for [**Build a Coding Agent**](https://leanpub.com/build-your-own-coding-agent) — a book that teaches you how to build an autonomous AI coding agent from scratch using pure Python.
+This is the companion code repository for [**Build Your Own Coding Agent**](https://buildyourowncodingagent.com) — a book that teaches you how to build an autonomous AI coding agent from scratch using pure Python.
 
 No LangChain. No vector databases. No "orchestration frameworks." Just `requests`, `subprocess`, and code you can debug with `print()`.
 
