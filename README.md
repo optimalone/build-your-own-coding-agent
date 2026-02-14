@@ -10,7 +10,7 @@ No LangChain. No vector databases. No "orchestration frameworks." Just `requests
 
 - Read, write, and edit files in your codebase
 - Execute shell commands and iterate on errors
-- Search code using `git grep`
+- Search code across your project
 - Remember context across sessions
 - Search the web for current information
 - Run on Claude, DeepSeek, or local models via Ollama
@@ -40,8 +40,8 @@ Each `chXX/` folder contains a complete, runnable snapshot of the code at the en
 
 ```bash
 # Clone the repo
-git clone https://github.com/owenthereal/build-a-coding-agent.git
-cd build-a-coding-agent
+git clone https://github.com/owenthereal/build-your-own-coding-agent.git
+cd build-your-own-coding-agent
 
 # Create virtual environment
 python3 -m venv venv
@@ -79,12 +79,20 @@ pytest
 - An Anthropic API key (get one at [console.anthropic.com](https://console.anthropic.com))
 - Optional: DeepSeek API key, Ollama for local models
 
+## Community Implementations
+
+The book's reference implementation is Python, but the concepts — the loop, the tools, the brain abstraction — are language-agnostic. Community ports live in the `contrib/` directory:
+
+| Language | Directory | Contributor |
+|----------|-----------|-------------|
+| *Your language here* | — | [See CONTRIBUTING.md](CONTRIBUTING.md) |
+
 ## The Book
 
-This code accompanies the book **Build a Coding Agent**, available on:
+This code accompanies the book **Build Your Own Coding Agent**, available on:
 
 - [Leanpub](https://leanpub.com/build-your-own-coding-agent)
-- Amazon (coming soon)
+- [Amazon/Kindle](https://mybook.to/build-a-coding-agent)
 
 The book follows a "Zero Magic" philosophy — every abstraction is explained with physical metaphors, and every line of code serves a purpose you'll understand.
 
