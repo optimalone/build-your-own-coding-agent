@@ -33,7 +33,7 @@ payload = {
 
 # 5. Fire! (No safety net)
 print("📡 Sending request to Claude...")
-response = requests.post(url, headers=headers, json=payload)
+response = requests.post(url, headers=headers, json=payload, timeout=120)
 
 # 6. Inspect the raw result
 print(f"Status: {response.status_code}")

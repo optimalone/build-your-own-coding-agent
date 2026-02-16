@@ -14,6 +14,8 @@ from nanocode import (
 
 class FakeBrain:
     """Fake brain for testing - returns predictable responses."""
+    context_limit = 200_000
+    last_input_tokens = 0
 
     def __init__(self, responses=None):
         self.responses = responses or [Thought(text="Fake response", raw_content=[{"type": "text", "text": "Fake response"}])]
@@ -165,3 +167,26 @@ def test_version_is_1_0():
     import inspect
     source = inspect.getsource(nanocode.main)
     assert "v1.0" in source
+
+
+# --- Context Compaction Tests ---
+
+def test_compact_conversation_summarizes():
+    """Verify compaction replaces conversation with summary."""
+    summary = Thought(
+        text="Summary of conversation",
+        raw_content=[{"type": "text", "text": "Summary of conversation"}]
+    )
+    responses = [
+        Thought(text="Response 1", raw_content=[{"type": "text", "text": "Response 1"}]),
+        summary,
+    ]
+    brain = FakeBrain(responses=responses)
+    brain.last_input_tokens = 200_000  # Over 75% threshold
+    agent = Agent(brain=brain, tools=tools, mode="act")
+
+    agent.handle_input("Do something")
+
+    # After compaction, conversation should be short (summary + current response)
+    assert len(agent.conversation) <= 4
+    assert "Summary" in str(agent.conversation[0]["content"])

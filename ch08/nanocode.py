@@ -26,7 +26,13 @@ def request_with_retry(url, headers, payload, max_retries=5):
             time.sleep(wait_time)
             continue
 
-        response.raise_for_status()
+        if response.status_code >= 400:
+            try:
+                error_msg = response.json()["error"]["message"]
+            except (KeyError, ValueError):
+                error_msg = response.text
+            raise Exception(f"API error ({response.status_code}): {error_msg}")
+
         return response
 
     raise Exception(f"Request failed after {max_retries} retries")
@@ -264,7 +270,7 @@ class WriteFile:
 
     def execute(self, context, path, content):
         # Always allow writing to PLAN.md
-        if path.endswith("PLAN.md"):
+        if os.path.basename(path) == "PLAN.md":
             print(f"  → Writing {path}")
             try:
                 with open(path, 'w', encoding='utf-8') as f:

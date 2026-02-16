@@ -12,6 +12,8 @@ from nanocode import (
 
 class FakeBrain:
     """Fake brain for testing - returns predictable responses."""
+    context_limit = 200_000
+    last_input_tokens = 0
 
     def __init__(self, responses=None, memory=None, tools=None):
         self.memory = memory
@@ -350,3 +352,26 @@ def test_edit_file_not_found():
         assert "Could not find" in result
     finally:
         os.unlink(temp_path)
+
+
+# --- Context Compaction Tests ---
+
+def test_compact_conversation_summarizes():
+    """Verify compaction replaces conversation with summary."""
+    summary = Thought(
+        text="Summary of conversation",
+        raw_content=[{"type": "text", "text": "Summary of conversation"}]
+    )
+    responses = [
+        Thought(text="Response 1", raw_content=[{"type": "text", "text": "Response 1"}]),
+        summary,
+    ]
+    brain = FakeBrain(responses=responses)
+    brain.last_input_tokens = 200_000  # Over 75% threshold
+    agent = Agent(brain=brain, tools=tools, mode="act")
+
+    agent.handle_input("Do something")
+
+    # After compaction, conversation should be short (summary + current response)
+    assert len(agent.conversation) <= 4
+    assert "Summary" in str(agent.conversation[0]["content"])

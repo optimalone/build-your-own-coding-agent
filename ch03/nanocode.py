@@ -115,7 +115,7 @@ class Agent:
 def main():
     brain = Claude()
     agent = Agent(brain)
-    print("⚡ Nanocode v0.2 (Memory Active)")
+    print("⚡ Nanocode v0.2 (Conversation Memory)")
     print("Type '/q' to quit.\n")
 
     while True:

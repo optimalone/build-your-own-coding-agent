@@ -27,7 +27,13 @@ def request_with_retry(url, headers, payload, max_retries=5):
             time.sleep(wait_time)
             continue
 
-        response.raise_for_status()
+        if response.status_code >= 400:
+            try:
+                error_msg = response.json()["error"]["message"]
+            except (KeyError, ValueError):
+                error_msg = response.text
+            raise Exception(f"API error ({response.status_code}): {error_msg}")
+
         return response
 
     raise Exception(f"Request failed after {max_retries} retries")
@@ -104,6 +110,8 @@ class ToolContext:
 
 class Brain:
     """Base class for LLM providers."""
+    context_limit = 200_000
+    last_input_tokens = 0
 
     def think(self, conversation):
         """Process conversation, return Thought."""
@@ -140,7 +148,9 @@ class Claude(Brain):
 
         print("(Claude is thinking...)")
         response = request_with_retry(self.url, headers, payload)
-        return self._parse_response(response.json()["content"])
+        data = response.json()
+        self.last_input_tokens = data.get("usage", {}).get("input_tokens", 0)
+        return self._parse_response(data["content"])
 
     def _parse_response(self, content):
         """Convert Claude's response format to Thought."""
@@ -166,6 +176,7 @@ class Claude(Brain):
 
 class DeepSeek(Brain):
     """DeepSeek API (Anthropic-compatible, with tool support)."""
+    context_limit = 128_000
 
     def __init__(self, memory=None, tools=None):
         self.memory = memory
@@ -194,7 +205,9 @@ class DeepSeek(Brain):
 
         print("(DeepSeek is thinking...)")
         response = request_with_retry(self.url, headers, payload)
-        return self._parse_response(response.json()["content"])
+        data = response.json()
+        self.last_input_tokens = data.get("usage", {}).get("input_tokens", 0)
+        return self._parse_response(data["content"])
 
     def _parse_response(self, content):
         """Convert Anthropic response format to Thought."""
@@ -220,12 +233,30 @@ class DeepSeek(Brain):
 
 class Ollama(Brain):
     """Ollama local model (Anthropic-compatible API, with tool support)."""
+    context_limit = 32_000
 
     def __init__(self, memory=None, tools=None):
         self.memory = memory
         self.tools = tools or []
         self.model = os.getenv("OLLAMA_MODEL", "qwen3-coder:30b")
         self.url = "http://localhost:11434/v1/messages"
+        self._detect_context_limit()
+
+    def _detect_context_limit(self):
+        """Query Ollama for the model's context window size."""
+        try:
+            response = requests.post(
+                "http://localhost:11434/api/show",
+                json={"model": self.model},
+                timeout=2
+            )
+            model_info = response.json().get("model_info", {})
+            for key, value in model_info.items():
+                if key.endswith(".context_length"):
+                    self.context_limit = value
+                    return
+        except Exception:
+            pass  # Keep default
 
     def think(self, conversation):
         headers = {
@@ -245,7 +276,9 @@ class Ollama(Brain):
 
         print(f"({self.model} is thinking...)")
         response = request_with_retry(self.url, headers, payload)
-        return self._parse_response(response.json()["content"])
+        data = response.json()
+        self.last_input_tokens = data.get("usage", {}).get("input_tokens", 0)
+        return self._parse_response(data["content"])
 
     def _parse_response(self, content):
         """Convert Anthropic response format to Thought."""
@@ -317,7 +350,7 @@ class WriteFile:
 
     def execute(self, context, path, content):
         # Always allow writing to PLAN.md
-        if path.endswith("PLAN.md"):
+        if os.path.basename(path) == "PLAN.md":
             print(f"  → Writing {path}")
             try:
                 with open(path, 'w', encoding='utf-8') as f:
@@ -572,9 +605,14 @@ class Agent:
     def _agentic_loop(self):
         """Process brain responses, executing tools until done."""
         output_parts = []
+        max_iterations = 25
 
-        while True:
+        for _iteration in range(max_iterations):
             thought = self.brain.think(self.conversation)
+
+            # Compact if approaching context limit
+            if self.brain.last_input_tokens > self.brain.context_limit * 0.75:
+                self._compact_conversation()
 
             # Store raw content for message history
             self.conversation.append({"role": "assistant", "content": thought.raw_content})
@@ -598,8 +636,28 @@ class Agent:
                 })
 
             self.conversation.append({"role": "user", "content": tool_results})
+        else:
+            output_parts.append("(Stopped: too many iterations)")
 
         return "\n".join(output_parts)
+
+    def _compact_conversation(self):
+        """Summarize old messages to stay within context limits."""
+        print("(Compacting conversation...)")
+        history = "\n".join(
+            f"{m['role']}: {str(m['content'])[:500]}"
+            for m in self.conversation
+        )
+        prompt = [{
+            "role": "user",
+            "content": f"Summarize this conversation for continuity. "
+                       f"Focus on what was accomplished, what's in progress, "
+                       f"and key decisions:\n\n{history}"
+        }]
+        thought = self.brain.think(prompt)
+        self.conversation = [
+            {"role": "user", "content": f"Previous conversation summary: {thought.text}"},
+        ]
 
     def _execute_tool(self, name, args):
         """Execute a tool by name with given arguments."""
