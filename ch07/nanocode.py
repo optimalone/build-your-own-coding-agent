@@ -9,7 +9,7 @@ load_dotenv()
 
 # --- HTTP Helpers ---
 
-def request_with_retry(url, headers, payload, max_retries=5):
+def request_with_retry(url, headers, payload, max_retries=10):
     """Make HTTP POST with retry on rate limit (429), server errors (5xx), and network failures."""
     for attempt in range(max_retries):
         try:
@@ -21,7 +21,8 @@ def request_with_retry(url, headers, payload, max_retries=5):
             continue
 
         if response.status_code == 429 or response.status_code >= 500:
-            wait_time = 2 ** attempt  # 1, 2, 4, 8, 16 seconds
+            retry_after = response.headers.get("retry-after")
+            wait_time = int(retry_after) if retry_after else 2 ** attempt
             print(f"Error {response.status_code}. Retrying in {wait_time}s...")
             time.sleep(wait_time)
             continue
@@ -124,7 +125,7 @@ class Claude(Brain):
         self.api_key = os.getenv("ANTHROPIC_API_KEY")
         if not self.api_key:
             raise ValueError("ANTHROPIC_API_KEY not found in .env")
-        self.model = "claude-sonnet-4-5-20250929"
+        self.model = "claude-sonnet-4-6"
         self.url = "https://api.anthropic.com/v1/messages"
 
     def think(self, conversation):

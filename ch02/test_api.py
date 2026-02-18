@@ -24,7 +24,7 @@ headers = {
 
 # 4. Construct the payload
 payload = {
-    "model": "claude-sonnet-4-5-20250929",
+    "model": "claude-sonnet-4-6",
     "max_tokens": 4096,
     "messages": [
         {"role": "user", "content": "Hello, are you ready to code?"}

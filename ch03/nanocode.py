@@ -40,7 +40,7 @@ class Claude:
         self.api_key = os.getenv("ANTHROPIC_API_KEY")
         if not self.api_key:
             raise ValueError("ANTHROPIC_API_KEY not found in .env")
-        self.model = "claude-sonnet-4-5-20250929"
+        self.model = "claude-sonnet-4-6"
         self.url = "https://api.anthropic.com/v1/messages"
 
     def think(self, conversation):
