@@ -132,6 +132,8 @@ class Brain:
         current_index = 0
         input_tokens = 0
         has_text = False
+        open_blocks = set()
+        message_complete = False
 
         for line in response.iter_lines():
             if not line:
@@ -156,8 +158,9 @@ class Brain:
             elif event_type == "content_block_start":
                 block = data.get("content_block", {})
                 current_index = data.get("index", 0)
-                blocks[current_index] = {"type": block.get("type")}
+                blocks[current_index] = dict(block)
                 block_parts[current_index] = []
+                open_blocks.add(current_index)
                 if block.get("type") == "tool_use":
                     current_tool = {"id": block["id"], "name": block["name"], "input": ""}
                 elif block.get("type") == "thinking":
@@ -199,10 +202,18 @@ class Brain:
                     tool_calls.append(tc)
                     blocks[idx]["tool_call"] = tc
                     current_tool = None
+                open_blocks.discard(idx)
 
             elif event_type == "message_stop":
+                if open_blocks:
+                    raise Exception("Stream error: Unclosed content block at message_stop")
+                message_complete = True
                 if has_text:
                     print()  # Newline after streamed text
+                break
+
+        if not message_complete:
+            raise Exception("Stream error: Missing message_stop; response is incomplete")
 
         self.last_input_tokens = input_tokens
 
@@ -213,12 +224,15 @@ class Brain:
         for idx in sorted(blocks.keys()):
             block = blocks[idx]
             content = block.get("content", "")
-            if block["type"] == "thinking" and content:
+            if block["type"] == "thinking":
                 entry = {"type": "thinking", "thinking": content}
                 if "signature" in block:
                     entry["signature"] = block["signature"]
                 raw_content.append(entry)
-                all_thinking.append(content)
+                if content:
+                    all_thinking.append(content)
+            elif block["type"] == "redacted_thinking":
+                raw_content.append(block.copy())
             elif block["type"] == "text" and content:
                 raw_content.append({"type": "text", "text": content})
                 all_text.append(content)
@@ -285,7 +299,7 @@ class DeepSeek(Brain):
         self.api_key = os.getenv("DEEPSEEK_API_KEY")
         if not self.api_key:
             raise ValueError("DEEPSEEK_API_KEY not found in .env")
-        self.model = "deepseek-chat"
+        self.model = "deepseek-v4-pro"
         self.url = "https://api.deepseek.com/anthropic/v1/messages"
 
     def think(self, conversation):
@@ -297,6 +311,7 @@ class DeepSeek(Brain):
         payload = {
             "model": self.model,
             "max_tokens": 4096,
+            "thinking": {"type": "disabled"},
             "messages": conversation,
             "stream": True,
         }
@@ -318,25 +333,61 @@ class Ollama(Brain):
         self.system = None
         self.model = os.getenv("OLLAMA_MODEL", "qwen3-coder:30b")
         self.url = "http://localhost:11434/v1/messages"
-        self._detect_context_limit()
 
     def _detect_context_limit(self):
-        """Query Ollama for the model's context window size."""
+        """Read the active context window of the matching loaded model."""
         try:
-            response = requests.post(
-                "http://localhost:11434/api/show",
-                json={"model": self.model},
-                timeout=2
-            )
-            model_info = response.json().get("model_info", {})
-            for key, value in model_info.items():
-                if key.endswith(".context_length"):
-                    self.context_limit = value
-                    return
-        except Exception:
-            pass  # Keep default
+            response = requests.get("http://localhost:11434/api/ps", timeout=2)
+            response.raise_for_status()
+            data = response.json()
+        except requests.RequestException as e:
+            raise RuntimeError(
+                "Cannot read Ollama's loaded context. Check that Ollama is running "
+                "and load the model with the desired context before retrying."
+            ) from e
+        except ValueError as e:
+            raise ValueError("Ollama /api/ps returned invalid context metadata.") from e
+
+        models = data.get("models") if isinstance(data, dict) else None
+        if not isinstance(models, list):
+            raise ValueError("Ollama /api/ps did not return loaded-model context metadata.")
+
+        def canonical_name(name):
+            # Ollama fills these defaults and compares all name parts without case.
+            parts = name.split("://", 1)[-1].lower().rsplit("/", 2)
+            if len(parts) == 1:
+                parts = ["registry.ollama.ai", "library"] + parts
+            elif len(parts) == 2:
+                parts = ["registry.ollama.ai"] + parts
+            if ":" not in parts[-1]:
+                parts[-1] += ":latest"
+            return "/".join(parts)
+
+        model_name = canonical_name(self.model)
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+            names = [model.get("name"), model.get("model")]
+            names = [
+                canonical_name(name) for name in names if isinstance(name, str)
+            ]
+            if model_name not in names:
+                continue
+            context_length = model.get("context_length")
+            if type(context_length) is not int or context_length <= 0:
+                raise ValueError(
+                    f"Ollama has no usable loaded context for {self.model}. "
+                    "Reload the model with the desired context before retrying."
+                )
+            self.context_limit = context_length
+            return
+        raise ValueError(
+            f"Ollama model {self.model} is not loaded. "
+            "Load it with the desired context and keep it running before retrying."
+        )
 
     def think(self, conversation):
+        self._detect_context_limit()
         headers = {
             "x-api-key": "ollama",  # Required but not validated
             "anthropic-version": "2023-06-01",
@@ -584,14 +635,11 @@ class RunCommand:
                 cwd=os.getcwd()
             )
 
-            output = ""
+            output = f"Exit code: {result.returncode}\n"
             if result.stdout:
                 output += f"STDOUT:\n{result.stdout}\n"
             if result.stderr:
                 output += f"STDERR:\n{result.stderr}\n"
-            if not output:
-                output = "(No output)"
-
             return output.strip()
 
         except subprocess.TimeoutExpired:
@@ -726,6 +774,7 @@ class Agent:
         max_iterations = 50
 
         for _iteration in range(max_iterations):
+            self.brain.system = self._build_system_prompt()
             thought = self.brain.think(self.conversation)
 
             # Compact if approaching context limit
@@ -775,6 +824,7 @@ class Agent:
         saved_tools = self.brain.tools
         self.brain.tools = []
         try:
+            self.brain.system = self._build_system_prompt()
             thought = self.brain.think(prompt)
         finally:
             self.brain.tools = saved_tools
@@ -787,6 +837,8 @@ class Agent:
         tool = get_tool(self.tools, name)
         if tool is None:
             return f"Error: Tool '{name}' not found"
+        if self.mode == "plan" and not tool.plan_safe:
+            return f"Error: Tool '{name}' is not allowed in plan mode"
         try:
             context = ToolContext(memory=self.memory)
             return tool.execute(context, **args)

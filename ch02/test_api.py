@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 load_dotenv()
 api_key = os.getenv("ANTHROPIC_API_KEY")
 
-# Basic check so we don't crash with a confusing "NoneType" error later
+# Fail early with a clear message instead of an API authentication error
 if not api_key:
     print("Error: ANTHROPIC_API_KEY not found in .env")
     exit(1)

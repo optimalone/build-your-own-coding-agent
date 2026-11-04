@@ -419,3 +419,149 @@ def test_compact_conversation_restores_tools_on_error():
 
     # Tools should be restored despite the compaction error
     assert len(brain.tools) > 0
+
+
+# --- Runtime regression tests ---
+
+def test_deepseek_sends_supported_model_with_thinking_disabled(monkeypatch):
+    import nanocode
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "offline-test-key")
+    payloads = []
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"content": [{"type": "text", "text": "hello"}],
+                    "usage": {"input_tokens": 12}}
+
+    def post(url, headers, json, timeout):
+        assert url == "https://api.deepseek.com/anthropic/v1/messages"
+        payloads.append(json)
+        return Response()
+
+    monkeypatch.setattr(nanocode.requests, "post", post)
+    thought = nanocode.DeepSeek().think([{"role": "user", "content": "hello"}])
+
+    assert thought.text == "hello"
+    assert payloads[0]["model"] == "deepseek-v4-pro"
+    assert payloads[0]["thinking"] == {"type": "disabled"}
+
+
+def test_plan_dispatch_refuses_write_requested_by_brain(tmp_path):
+    path = tmp_path / "forbidden.py"
+    call = ToolCall("write-1", "write_file", {"path": str(path), "content": "unsafe"})
+    brain = FakeBrain(responses=[
+        Thought(tool_calls=[call], raw_content=[{
+            "type": "tool_use", "id": call.id, "name": call.name, "input": call.args,
+        }]),
+        Thought(text="done", raw_content=[{"type": "text", "text": "done"}]),
+    ])
+    agent = Agent(brain=brain, tools=tools, mode="plan")
+
+    agent.handle_input("write this file")
+
+    assert not path.exists()
+    result = agent.conversation[2]["content"][0]["content"]
+    assert "Error" in result
+    assert "plan mode" in result.lower()
+
+
+def test_act_dispatch_allows_write(tmp_path):
+    path = tmp_path / "allowed.py"
+    agent = Agent(brain=FakeBrain(), tools=tools, mode="act")
+
+    agent._execute_tool("write_file", {"path": str(path), "content": "allowed"})
+
+    assert path.read_text() == "allowed"
+
+
+def test_saved_memory_refreshes_next_model_request(tmp_path):
+    memory = Memory(path=str(tmp_path / ".nanocode" / "memory.md"))
+    call = ToolCall("memory-1", "save_memory", {"content": "Remember the blue project"})
+    seen_systems = []
+
+    class RecordingBrain(FakeBrain):
+        def think(self, conversation):
+            seen_systems.append(self.system)
+            return super().think(conversation)
+
+    brain = RecordingBrain(responses=[
+        Thought(tool_calls=[call], raw_content=[{
+            "type": "tool_use", "id": call.id, "name": call.name, "input": call.args,
+        }]),
+        Thought(text="saved", raw_content=[{"type": "text", "text": "saved"}]),
+        Thought(text="next turn", raw_content=[{"type": "text", "text": "next turn"}]),
+    ])
+    agent = Agent(brain=brain, tools=tools, memory=memory, mode="plan")
+
+    agent.handle_input("remember this")
+    agent.handle_input("what do you remember?")
+
+    assert "Remember the blue project" not in seen_systems[0]
+    assert all("Remember the blue project" in system for system in seen_systems[1:])
+    assert all("PLAN mode" in system for system in seen_systems)
+    assert __import__("pathlib").Path(memory.path).read_text() == "Remember the blue project"
+
+
+@pytest.mark.parametrize("name,args", [
+    ("edit_file", {"path": "unused", "old_text": "x", "new_text": "y"}),
+    ("run_command", {"command": "exit 0"}),
+])
+def test_plan_dispatch_refuses_act_only_tools(name, args, monkeypatch):
+    agent = Agent(brain=FakeBrain(), tools=tools, mode="plan")
+    tool = get_tool(agent.tools, name)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("act-only tool executed in plan mode")
+
+    monkeypatch.setattr(tool, "execute", forbidden)
+    result = agent._execute_tool(name, args)
+    assert "Error" in result
+    assert "plan mode" in result.lower()
+
+
+@pytest.mark.parametrize("status", [0, 7])
+def test_run_command_reports_silent_exit_status(status):
+    result = RunCommand().execute(ToolContext(), command=f"exit {status}")
+    assert f"Exit code: {status}" in result
+
+
+def test_run_command_keeps_output_with_failure_status():
+    result = RunCommand().execute(
+        ToolContext(), command="printf success; printf failure >&2; exit 3"
+    )
+    assert "Exit code: 3" in result
+    assert "STDOUT:\nsuccess" in result
+    assert "STDERR:\nfailure" in result
+
+
+def test_run_command_timeout_still_reports_error(monkeypatch):
+    import nanocode
+
+    def timeout(*args, **kwargs):
+        raise nanocode.subprocess.TimeoutExpired("slow", 1)
+
+    monkeypatch.setattr(nanocode.subprocess, "run", timeout)
+    assert "timed out" in RunCommand().execute(ToolContext(), "slow")
+
+
+def test_compaction_refreshes_saved_memory(tmp_path):
+    memory = Memory(path=str(tmp_path / ".nanocode" / "memory.md"))
+    seen_systems = []
+
+    class RecordingBrain(FakeBrain):
+        def think(self, conversation):
+            seen_systems.append(self.system)
+            return Thought(text="summary")
+
+    brain = RecordingBrain()
+    agent = Agent(brain=brain, tools=tools, memory=memory)
+    agent._execute_tool("save_memory", {"content": "new memory for summary"})
+    agent.conversation = [{"role": "user", "content": "prior work"}]
+
+    agent._compact_conversation()
+
+    assert "new memory for summary" in seen_systems[0]
+    assert "PLAN mode" in seen_systems[0]

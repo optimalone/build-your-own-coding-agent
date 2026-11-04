@@ -213,3 +213,31 @@ def test_thought_stores_raw_content():
     raw = [{"type": "text", "text": "Hello"}]
     thought = Thought(text="Hello", raw_content=raw)
     assert thought.raw_content == raw
+
+
+# --- Runtime regression tests ---
+
+def test_deepseek_sends_supported_model_with_thinking_disabled(monkeypatch):
+    import nanocode
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "offline-test-key")
+    payloads = []
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"content": [{"type": "text", "text": "hello"}],
+                    "usage": {"input_tokens": 12}}
+
+    def post(url, headers, json, timeout):
+        assert url == "https://api.deepseek.com/anthropic/v1/messages"
+        payloads.append(json)
+        return Response()
+
+    monkeypatch.setattr(nanocode.requests, "post", post)
+    thought = nanocode.DeepSeek().think([{"role": "user", "content": "hello"}])
+
+    assert thought.text == "hello"
+    assert payloads[0]["model"] == "deepseek-v4-pro"
+    assert payloads[0]["thinking"] == {"type": "disabled"}

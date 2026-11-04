@@ -191,7 +191,7 @@ class DeepSeek(Brain):
         self.api_key = os.getenv("DEEPSEEK_API_KEY")
         if not self.api_key:
             raise ValueError("DEEPSEEK_API_KEY not found in .env")
-        self.model = "deepseek-chat"
+        self.model = "deepseek-v4-pro"
         self.url = "https://api.deepseek.com/anthropic/v1/messages"
 
     def think(self, conversation):
@@ -203,6 +203,7 @@ class DeepSeek(Brain):
         payload = {
             "model": self.model,
             "max_tokens": 4096,
+            "thinking": {"type": "disabled"},
             "messages": conversation
         }
         if self.system:
@@ -475,6 +476,7 @@ class Agent:
         output_parts = []
 
         while True:
+            self.brain.system = self._build_system_prompt()
             thought = self.brain.think(self.conversation)
 
             # Display thinking
@@ -514,6 +516,8 @@ class Agent:
         tool = get_tool(self.tools, name)
         if tool is None:
             return f"Error: Tool '{name}' not found"
+        if self.mode == "plan" and not tool.plan_safe:
+            return f"Error: Tool '{name}' is not allowed in plan mode"
         try:
             context = ToolContext(memory=self.memory)
             return tool.execute(context, **args)

@@ -185,3 +185,87 @@ def test_agent_has_all_tools():
     assert "write_file" in tool_names
     assert "write_plan" in tool_names
     assert "save_memory" in tool_names
+
+
+# --- Runtime regression tests ---
+
+def test_deepseek_sends_supported_model_with_thinking_disabled(monkeypatch):
+    import nanocode
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "offline-test-key")
+    payloads = []
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return {"content": [{"type": "text", "text": "hello"}],
+                    "usage": {"input_tokens": 12}}
+
+    def post(url, headers, json, timeout):
+        assert url == "https://api.deepseek.com/anthropic/v1/messages"
+        payloads.append(json)
+        return Response()
+
+    monkeypatch.setattr(nanocode.requests, "post", post)
+    thought = nanocode.DeepSeek().think([{"role": "user", "content": "hello"}])
+
+    assert thought.text == "hello"
+    assert payloads[0]["model"] == "deepseek-v4-pro"
+    assert payloads[0]["thinking"] == {"type": "disabled"}
+
+
+def test_plan_dispatch_refuses_write_requested_by_brain(tmp_path):
+    path = tmp_path / "forbidden.py"
+    call = ToolCall("write-1", "write_file", {"path": str(path), "content": "unsafe"})
+    brain = FakeBrain(responses=[
+        Thought(tool_calls=[call], raw_content=[{
+            "type": "tool_use", "id": call.id, "name": call.name, "input": call.args,
+        }]),
+        Thought(text="done", raw_content=[{"type": "text", "text": "done"}]),
+    ])
+    agent = Agent(brain=brain, tools=tools, mode="plan")
+
+    agent.handle_input("write this file")
+
+    assert not path.exists()
+    result = agent.conversation[2]["content"][0]["content"]
+    assert "Error" in result
+    assert "plan mode" in result.lower()
+
+
+def test_act_dispatch_allows_write(tmp_path):
+    path = tmp_path / "allowed.py"
+    agent = Agent(brain=FakeBrain(), tools=tools, mode="act")
+
+    agent._execute_tool("write_file", {"path": str(path), "content": "allowed"})
+
+    assert path.read_text() == "allowed"
+
+
+def test_saved_memory_refreshes_next_model_request(tmp_path):
+    memory = Memory(path=str(tmp_path / ".nanocode" / "memory.md"))
+    call = ToolCall("memory-1", "save_memory", {"content": "Remember the blue project"})
+    seen_systems = []
+
+    class RecordingBrain(FakeBrain):
+        def think(self, conversation):
+            seen_systems.append(self.system)
+            return super().think(conversation)
+
+    brain = RecordingBrain(responses=[
+        Thought(tool_calls=[call], raw_content=[{
+            "type": "tool_use", "id": call.id, "name": call.name, "input": call.args,
+        }]),
+        Thought(text="saved", raw_content=[{"type": "text", "text": "saved"}]),
+        Thought(text="next turn", raw_content=[{"type": "text", "text": "next turn"}]),
+    ])
+    agent = Agent(brain=brain, tools=tools, memory=memory, mode="plan")
+
+    agent.handle_input("remember this")
+    agent.handle_input("what do you remember?")
+
+    assert "Remember the blue project" not in seen_systems[0]
+    assert all("Remember the blue project" in system for system in seen_systems[1:])
+    assert all("PLAN mode" in system for system in seen_systems)
+    assert __import__("pathlib").Path(memory.path).read_text() == "Remember the blue project"

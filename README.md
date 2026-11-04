@@ -66,13 +66,21 @@ python ch01/nanocode.py
 # Chapter 3+: Needs API key in .env
 python ch03/nanocode.py
 
-# Chapter 10+: Can use local models
+# Chapter 10+: Load a tool-capable local model before starting Nanocode
+# Set OLLAMA_MODEL first if using a different model (e.g. llama3.2:3b).
+ollama pull "${OLLAMA_MODEL:-qwen3-coder:30b}"
+ollama run --keepalive 1h "${OLLAMA_MODEL:-qwen3-coder:30b}" "Reply with ready"
+ollama ps
 NANOCODE_BRAIN=ollama python ch10/nanocode.py
 
 # Run tests (no API key needed)
 cd ch09
 pytest
 ```
+
+Ollama must report the selected model’s active context window in `/api/ps`;
+Nanocode stops before inference if it cannot determine that window. Plan mode
+refuses act-only tools at dispatch, but is not a filesystem sandbox.
 
 ## Requirements
 
