@@ -197,7 +197,7 @@ class DeepSeek(Brain):
         self.api_key = os.getenv("DEEPSEEK_API_KEY")
         if not self.api_key:
             raise ValueError("DEEPSEEK_API_KEY not found in .env")
-        self.model = "deepseek-chat"
+        self.model = "deepseek-v4-pro"
         self.url = "https://api.deepseek.com/anthropic/v1/messages"
 
     def think(self, conversation):
@@ -209,6 +209,7 @@ class DeepSeek(Brain):
         payload = {
             "model": self.model,
             "max_tokens": 4096,
+            "thinking": {"type": "disabled"},
             "messages": conversation
         }
         if self.system:
@@ -232,25 +233,54 @@ class Ollama(Brain):
         self.system = None
         self.model = os.getenv("OLLAMA_MODEL", "qwen3-coder:30b")
         self.url = "http://localhost:11434/v1/messages"
-        self._detect_context_limit()
 
     def _detect_context_limit(self):
-        """Query Ollama for the model's context window size."""
+        """Read the active context window of the matching loaded model."""
         try:
-            response = requests.post(
-                "http://localhost:11434/api/show",
-                json={"model": self.model},
-                timeout=2
-            )
-            model_info = response.json().get("model_info", {})
-            for key, value in model_info.items():
-                if key.endswith(".context_length"):
-                    self.context_limit = value
-                    return
-        except Exception:
-            pass  # Keep default
+            response = requests.get("http://localhost:11434/api/ps", timeout=2)
+            response.raise_for_status()
+            data = response.json()
+        except requests.RequestException as e:
+            raise RuntimeError(
+                "Cannot read Ollama's loaded context. Check that Ollama is running "
+                "and load the model with the desired context before retrying."
+            ) from e
+        except ValueError as e:
+            raise ValueError("Ollama /api/ps returned invalid context metadata.") from e
+
+        models = data.get("models") if isinstance(data, dict) else None
+        if not isinstance(models, list):
+            raise ValueError("Ollama /api/ps did not return loaded-model context metadata.")
+
+        # Ollama gives untagged model names the :latest tag.
+        model_name = self.model
+        if ":" not in model_name.rsplit("/", 1)[-1]:
+            model_name += ":latest"
+        for model in models:
+            if not isinstance(model, dict):
+                continue
+            names = [model.get("name"), model.get("model")]
+            names = [
+                name if ":" in name.rsplit("/", 1)[-1] else name + ":latest"
+                for name in names if isinstance(name, str)
+            ]
+            if model_name not in names:
+                continue
+            context_length = model.get("context_length")
+            if type(context_length) is not int or context_length <= 0:
+                raise ValueError(
+                    f"Ollama has no usable loaded context for {self.model}. "
+                    "Reload the model with the desired context before retrying."
+                )
+            self.context_limit = context_length
+            return
+        raise ValueError(
+            f"Ollama model {self.model} is not loaded. "
+            "Load it with the desired context and keep it running before retrying."
+        )
 
     def think(self, conversation):
+        self._detect_context_limit()
         headers = {
             "x-api-key": "ollama",  # Required but not validated
             "anthropic-version": "2023-06-01",
@@ -496,14 +526,11 @@ class RunCommand:
                 cwd=os.getcwd()
             )
 
-            output = ""
+            output = f"Exit code: {result.returncode}\n"
             if result.stdout:
                 output += f"STDOUT:\n{result.stdout}\n"
             if result.stderr:
                 output += f"STDERR:\n{result.stderr}\n"
-            if not output:
-                output = "(No output)"
-
             return output.strip()
 
         except subprocess.TimeoutExpired:
@@ -606,6 +633,7 @@ class Agent:
         max_iterations = 50
 
         for _iteration in range(max_iterations):
+            self.brain.system = self._build_system_prompt()
             thought = self.brain.think(self.conversation)
 
             # Display thinking
@@ -662,6 +690,7 @@ class Agent:
         saved_tools = self.brain.tools
         self.brain.tools = []
         try:
+            self.brain.system = self._build_system_prompt()
             thought = self.brain.think(prompt)
         finally:
             self.brain.tools = saved_tools
@@ -674,6 +703,8 @@ class Agent:
         tool = get_tool(self.tools, name)
         if tool is None:
             return f"Error: Tool '{name}' not found"
+        if self.mode == "plan" and not tool.plan_safe:
+            return f"Error: Tool '{name}' is not allowed in plan mode"
         try:
             context = ToolContext(memory=self.memory)
             return tool.execute(context, **args)

@@ -139,7 +139,7 @@ class DeepSeek(Brain):
         self.api_key = os.getenv("DEEPSEEK_API_KEY")
         if not self.api_key:
             raise ValueError("DEEPSEEK_API_KEY not found in .env")
-        self.model = "deepseek-chat"
+        self.model = "deepseek-v4-pro"
         self.url = "https://api.deepseek.com/anthropic/v1/messages"
 
     def think(self, conversation):
@@ -151,6 +151,7 @@ class DeepSeek(Brain):
         payload = {
             "model": self.model,
             "max_tokens": 4096,
+            "thinking": {"type": "disabled"},
             "messages": conversation
         }
 
