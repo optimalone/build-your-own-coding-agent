@@ -533,3 +533,84 @@ def test_ollama_metadata_failure_blocks_inference(monkeypatch, failure):
     monkeypatch.setattr(nanocode, "request_with_retry", unexpected)
     with pytest.raises((ValueError, RuntimeError), match="(?i)(ollama|context|load)"):
         brain.think([{"role": "user", "content": "hello"}])
+
+
+@pytest.mark.parametrize("configured,loaded,equivalent", [
+    ("library/qwen3-coder:30b", "qwen3-coder:30b", True),
+    ("registry.ollama.ai/library/qwen3-coder:30b", "qwen3-coder:30b", True),
+    ("qwen3-coder:30b", "library/qwen3-coder:30b", True),
+    ("qwen3-coder:30b", "registry.ollama.ai/library/qwen3-coder:30b", True),
+    ("QWEN3-CODER:30B", "qwen3-coder:30b", True),
+    ("REGISTRY.OLLAMA.AI/LIBRARY/Qwen3-Coder:30B", "qwen3-coder:30b", True),
+    ("qwen3-coder:30b", "REGISTRY.OLLAMA.AI/Library/QWEN3-CODER:30B", True),
+    ("library/my-model", "registry.ollama.ai/library/my-model:latest", True),
+    ("registry.local:5000/team/model", "REGISTRY.LOCAL:5000/TEAM/MODEL:latest", True),
+    ("https://registry.ollama.ai/library/qwen3-coder:30b", "qwen3-coder:30b", True),
+    ("qwen3-coder:30b", "team/qwen3-coder:30b", False),
+    ("team/qwen3-coder:30b", "qwen3-coder:30b", False),
+    ("team/qwen3-coder:30b", "other/qwen3-coder:30b", False),
+    ("qwen3-coder:30b", "registry.local/library/qwen3-coder:30b", False),
+    ("registry.local/library/qwen3-coder:30b", "qwen3-coder:30b", False),
+    ("registry.local:5000/team/model", "registry.local:5001/team/model:latest", False),
+    ("registry.local:5000/team/model", "registry.local/team/model:latest", False),
+    ("registry.ollama.ai:443/library/model", "model:latest", False),
+    ("registry.one/team/model", "registry.two/team/model:latest", False),
+    ("registry.local:5000/team/model", "registry.local:5000/other/model:latest", False),
+])
+def test_ollama_matches_loaded_context_by_model_identity(monkeypatch, configured, loaded, equivalent):
+    import nanocode
+
+    monkeypatch.setenv("OLLAMA_MODEL", configured)
+    requests_seen = []
+
+    class LoadedResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"models": [{
+                "name": loaded, "model": loaded, "size": 1000, "size_vram": 1000,
+                "digest": "sha256:offline", "expires_at": "2026-11-04T23:00:00Z",
+                "details": {"parent_model": "", "format": "gguf", "family": "qwen3",
+                            "families": ["qwen3"], "parameter_size": "30B",
+                            "quantization_level": "Q4_K_M"},
+                "context_length": 8192, "runner": "llama_cpp",
+            }]}
+
+    def get(url, timeout):
+        assert url == "http://localhost:11434/api/ps"
+        requests_seen.append("ps")
+        return LoadedResponse()
+
+    class MessageResponse:
+        status_code = 200
+        headers = {}
+
+        def json(self):
+            return {"id": "msg_test", "type": "message", "role": "assistant",
+                    "model": loaded, "content": [{"type": "text", "text": "answer"}],
+                    "stop_reason": "end_turn", "stop_sequence": None,
+                    "usage": {"input_tokens": 64, "output_tokens": 1}}
+
+    def post(url, headers, json, timeout):
+        assert url == "http://localhost:11434/v1/messages"
+        assert json["model"] == configured
+        assert brain.context_limit == 8192
+        requests_seen.append("messages")
+        return MessageResponse()
+
+    monkeypatch.setattr(nanocode.requests, "get", get)
+    monkeypatch.setattr(nanocode.requests, "post", post)
+    brain = Ollama()
+    conversation = [{"role": "user", "content": "hello"}]
+
+    if equivalent:
+        thought = brain.think(conversation)
+        assert thought.text == "answer"
+        assert brain.context_limit == 8192
+        assert brain.last_input_tokens == 64
+        assert requests_seen == ["ps", "messages"]
+    else:
+        with pytest.raises(ValueError, match="is not loaded"):
+            brain.think(conversation)
+        assert requests_seen == ["ps"]

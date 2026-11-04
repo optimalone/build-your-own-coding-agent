@@ -252,17 +252,24 @@ class Ollama(Brain):
         if not isinstance(models, list):
             raise ValueError("Ollama /api/ps did not return loaded-model context metadata.")
 
-        # Ollama gives untagged model names the :latest tag.
-        model_name = self.model
-        if ":" not in model_name.rsplit("/", 1)[-1]:
-            model_name += ":latest"
+        def canonical_name(name):
+            # Ollama fills these defaults and compares all name parts without case.
+            parts = name.split("://", 1)[-1].lower().rsplit("/", 2)
+            if len(parts) == 1:
+                parts = ["registry.ollama.ai", "library"] + parts
+            elif len(parts) == 2:
+                parts = ["registry.ollama.ai"] + parts
+            if ":" not in parts[-1]:
+                parts[-1] += ":latest"
+            return "/".join(parts)
+
+        model_name = canonical_name(self.model)
         for model in models:
             if not isinstance(model, dict):
                 continue
             names = [model.get("name"), model.get("model")]
             names = [
-                name if ":" in name.rsplit("/", 1)[-1] else name + ":latest"
-                for name in names if isinstance(name, str)
+                canonical_name(name) for name in names if isinstance(name, str)
             ]
             if model_name not in names:
                 continue
