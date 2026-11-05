@@ -345,10 +345,14 @@ class SearchCodebase:
         results = []
         try:
             for root, dirs, files in os.walk(path):
-                dirs[:] = [d for d in dirs if d not in {".git", "__pycache__", "venv", ".nanocode"}]
+                dirs[:] = [d for d in dirs if d not in {".git", "__pycache__", "venv", ".venv", ".nanocode"}]
 
                 for file in files:
+                    if file == ".env" or file.startswith(".env."):
+                        continue
                     file_path = os.path.join(root, file)
+                    if os.path.islink(file_path):
+                        continue
                     try:
                         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                             for i, line in enumerate(f):
@@ -449,12 +453,15 @@ class Agent:
         if user_input.strip().startswith("/mode"):
             return self._handle_mode_command(user_input)
 
-        self.conversation.append({"role": "user", "content": user_input})
+        user_message = {"role": "user", "content": user_input}
+        self.conversation.append(user_message)
 
         try:
             return self._agentic_loop()
         except Exception as e:
-            self.conversation.pop()  # Remove failed user message
+            # Remove the input only if no assistant or tool work was added.
+            if self.conversation and self.conversation[-1] is user_message:
+                self.conversation.pop()
             return f"Error: {e}"
 
     def _handle_mode_command(self, user_input):
@@ -523,6 +530,8 @@ class Agent:
             return tool.execute(context, **args)
         except TypeError as e:
             return f"Error: Invalid arguments - {e}"
+        except Exception as e:
+            return f"Error: Tool '{name}' failed - {e}"
 
     def _switch_brain(self):
         """Toggle to the next brain."""

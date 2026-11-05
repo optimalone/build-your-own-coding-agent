@@ -241,3 +241,122 @@ def test_deepseek_sends_supported_model_with_thinking_disabled(monkeypatch):
     assert thought.text == "hello"
     assert payloads[0]["model"] == "deepseek-v4-pro"
     assert payloads[0]["thinking"] == {"type": "disabled"}
+
+
+# --- Recovery and search privacy regressions ---
+
+class RecoveryBrain:
+    last_input_tokens = 0
+    context_limit = 200_000
+
+    def __init__(self, responses):
+        self.responses = iter(responses)
+        self.tools = []
+
+    def think(self, conversation):
+        response = next(self.responses)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+def assert_tool_results_follow_requests(conversation):
+    for index, message in enumerate(conversation):
+        if message["role"] != "assistant":
+            continue
+        requests = [block["id"] for block in message["content"]
+                    if block["type"] == "tool_use"]
+        if requests:
+            following = conversation[index + 1]
+            assert following["role"] == "user"
+            assert [block["tool_use_id"] for block in following["content"]
+                    if block["type"] == "tool_result"] == requests
+
+
+def test_inference_failure_preserves_completed_tool_results(tmp_path):
+    import nanocode
+
+    source = tmp_path / "source.py"
+    source.write_text("preserved source\n")
+    call = nanocode.ToolCall(id="read-1", name="read_file", args={"path": str(source)})
+    brain = RecoveryBrain([
+        nanocode.Thought(tool_calls=[call], raw_content=[
+            {"type": "tool_use", "id": "read-1", "name": "read_file", "input": call.args}
+        ]),
+        RuntimeError("inference unavailable"),
+        nanocode.Thought(text="Recovered", raw_content=[{"type": "text", "text": "Recovered"}]),
+    ])
+    agent = nanocode.Agent(brain=brain, tools=[nanocode.ReadFile()])
+
+    assert "inference unavailable" in agent.handle_input("Read the source")
+    assert len(agent.conversation) == 3
+    assert "preserved source" in agent.conversation[2]["content"][0]["content"]
+    assert_tool_results_follow_requests(agent.conversation)
+
+    agent.handle_input("Continue")
+    assert agent.conversation[-1] == {
+        "role": "assistant", "content": [{"type": "text", "text": "Recovered"}]
+    }
+    assert "preserved source" in agent.conversation[2]["content"][0]["content"]
+    assert_tool_results_follow_requests(agent.conversation)
+
+
+def test_initial_inference_failure_removes_only_new_user_message():
+    import nanocode
+
+    brain = RecoveryBrain([
+        nanocode.Thought(text="Hello", raw_content=[{"type": "text", "text": "Hello"}]),
+        RuntimeError("inference unavailable"),
+        nanocode.Thought(text="Recovered", raw_content=[{"type": "text", "text": "Recovered"}]),
+    ])
+    agent = nanocode.Agent(brain=brain, tools=[])
+    agent.handle_input("Hello")
+    previous = list(agent.conversation)
+
+    assert "inference unavailable" in agent.handle_input("Failed turn")
+    assert agent.conversation == previous
+    agent.handle_input("Try again")
+    assert agent.conversation[-1]["content"] == [{"type": "text", "text": "Recovered"}]
+
+
+def test_tool_exception_returns_results_for_all_calls_and_session_continues(tmp_path):
+    import nanocode
+
+    class BrokenReadFile(nanocode.ReadFile):
+        name = "broken_read"
+
+        def execute(self, *args, **kwargs):
+            raise RuntimeError("unexpected tool failure")
+
+    target = tmp_path / "created.py"
+    calls = [
+        nanocode.ToolCall(id="write-1", name="write_file",
+                          args={"path": str(target), "content": "completed write\n"}),
+        nanocode.ToolCall(id="broken-1", name="broken_read", args={"path": str(target)}),
+        nanocode.ToolCall(id="read-1", name="read_file", args={"path": str(target)}),
+    ]
+    brain = RecoveryBrain([
+        nanocode.Thought(tool_calls=calls, raw_content=[
+            {"type": "tool_use", "id": call.id, "name": call.name, "input": call.args}
+            for call in calls
+        ]),
+        nanocode.Thought(text="Finished", raw_content=[{"type": "text", "text": "Finished"}]),
+        nanocode.Thought(text="Continued", raw_content=[{"type": "text", "text": "Continued"}]),
+    ])
+    agent = nanocode.Agent(brain=brain, tools=[
+        nanocode.WriteFile(), BrokenReadFile(), nanocode.ReadFile()
+    ])
+    agent.mode = "act"
+
+    agent.handle_input("Write then read")
+    assert target.read_text() == "completed write\n"
+    assert len(agent.conversation) == 4
+    assert_tool_results_follow_requests(agent.conversation)
+    results = agent.conversation[2]["content"]
+    assert results[1]["content"].startswith("Error:")
+    assert "unexpected tool failure" in results[1]["content"]
+    assert "completed write" in results[2]["content"]
+
+    agent.handle_input("Continue")
+    assert agent.conversation[-1]["content"] == [{"type": "text", "text": "Continued"}]
+    assert_tool_results_follow_requests(agent.conversation)

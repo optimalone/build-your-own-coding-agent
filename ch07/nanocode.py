@@ -382,12 +382,15 @@ class Agent:
         if user_input.strip().startswith("/mode"):
             return self._handle_mode_command(user_input)
 
-        self.conversation.append({"role": "user", "content": user_input})
+        user_message = {"role": "user", "content": user_input}
+        self.conversation.append(user_message)
 
         try:
             return self._agentic_loop()
         except Exception as e:
-            self.conversation.pop()  # Remove failed user message
+            # Remove the input only if no assistant or tool work was added.
+            if self.conversation and self.conversation[-1] is user_message:
+                self.conversation.pop()
             return f"Error: {e}"
 
     def _handle_mode_command(self, user_input):
@@ -456,6 +459,8 @@ class Agent:
             return tool.execute(context, **args)
         except TypeError as e:
             return f"Error: Invalid arguments - {e}"
+        except Exception as e:
+            return f"Error: Tool '{name}' failed - {e}"
 
     def _switch_brain(self):
         """Toggle to the next brain."""
