@@ -140,6 +140,8 @@ def test_deepseek_sends_supported_model_with_thinking_disabled(monkeypatch):
 
     def post(url, headers, json, timeout):
         assert url == "https://api.deepseek.com/anthropic/v1/messages"
+        assert headers["x-api-key"] == "offline-test-key"
+        assert timeout == 120
         payloads.append(json)
         return Response()
 
@@ -147,5 +149,51 @@ def test_deepseek_sends_supported_model_with_thinking_disabled(monkeypatch):
     thought = nanocode.DeepSeek().think([{"role": "user", "content": "hello"}])
 
     assert thought.text == "hello"
-    assert payloads[0]["model"] == "deepseek-v4-pro"
+    assert payloads[0]["model"] == "deepseek-flash"
     assert payloads[0]["thinking"] == {"type": "disabled"}
+    assert payloads[0]["max_tokens"] == 4096
+    assert payloads[0]["messages"] == [{"role": "user", "content": "hello"}]
+
+
+# --- Current provider HTTP contracts ---
+
+def test_claude_sends_adaptive_thinking_contract(monkeypatch):
+    import nanocode
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "offline-test-key")
+    requests = []
+    conversation = [{"role": "user", "content": "hello"}]
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"content": [{"type": "text", "text": "hello"}],
+                    "usage": {"input_tokens": 12}}
+
+    def post(url, headers, json, timeout):
+        requests.append((url, headers, json, timeout))
+        return Response()
+
+    monkeypatch.setattr(nanocode.requests, "post", post)
+    thought = nanocode.Claude().think(conversation)
+
+    assert thought.text == "hello"
+    assert len(requests) == 1
+    url, headers, payload, timeout = requests[0]
+    assert url == "https://api.anthropic.com/v1/messages"
+    assert headers == {"x-api-key": "offline-test-key",
+                       "anthropic-version": "2023-06-01",
+                       "content-type": "application/json"}
+    assert timeout == 120
+    assert payload == {
+        "model": "claude-sonnet-5-5",
+        "max_tokens": 16000,
+        "thinking": {"type": "adaptive", "display": "summarized"},
+        "output_config": {"effort": "medium"},
+        "messages": conversation,
+    }
+    assert "budget_tokens" not in payload["thinking"]

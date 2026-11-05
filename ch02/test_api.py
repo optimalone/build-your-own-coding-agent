@@ -24,8 +24,10 @@ headers = {
 
 # 4. Construct the payload
 payload = {
-    "model": "claude-sonnet-4-6",
+    "model": "claude-sonnet-5-5",
     "max_tokens": 4096,
+    "thinking": {"type": "between_tools"},
+    "output_config": {"effort": "medium"},
     "messages": [
         {"role": "user", "content": "Hello, are you ready to code?"}
     ]

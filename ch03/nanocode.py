@@ -41,7 +41,7 @@ class Claude:
         self.api_key = os.getenv("ANTHROPIC_API_KEY")
         if not self.api_key:
             raise ValueError("ANTHROPIC_API_KEY not found in .env")
-        self.model = "claude-sonnet-4-6"
+        self.model = "claude-sonnet-5-5"
         self.url = "https://api.anthropic.com/v1/messages"
 
     def think(self, conversation):
@@ -53,10 +53,8 @@ class Claude:
         payload = {
             "model": self.model,
             "max_tokens": 16000,
-            "thinking": {
-                "type": "enabled",
-                "budget_tokens": 10000
-            },
+            "thinking": {"type": "adaptive", "display": "summarized"},
+            "output_config": {"effort": "medium"},
             "messages": conversation
         }
 

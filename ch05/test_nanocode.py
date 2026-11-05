@@ -232,6 +232,8 @@ def test_deepseek_sends_supported_model_with_thinking_disabled(monkeypatch):
 
     def post(url, headers, json, timeout):
         assert url == "https://api.deepseek.com/anthropic/v1/messages"
+        assert headers["x-api-key"] == "offline-test-key"
+        assert timeout == 120
         payloads.append(json)
         return Response()
 
@@ -239,8 +241,10 @@ def test_deepseek_sends_supported_model_with_thinking_disabled(monkeypatch):
     thought = nanocode.DeepSeek().think([{"role": "user", "content": "hello"}])
 
     assert thought.text == "hello"
-    assert payloads[0]["model"] == "deepseek-v4-pro"
+    assert payloads[0]["model"] == "deepseek-flash"
     assert payloads[0]["thinking"] == {"type": "disabled"}
+    assert payloads[0]["max_tokens"] == 4096
+    assert payloads[0]["messages"] == [{"role": "user", "content": "hello"}]
 
 
 # --- Recovery and search privacy regressions ---
@@ -360,3 +364,92 @@ def test_tool_exception_returns_results_for_all_calls_and_session_continues(tmp_
     agent.handle_input("Continue")
     assert agent.conversation[-1]["content"] == [{"type": "text", "text": "Continued"}]
     assert_tool_results_follow_requests(agent.conversation)
+
+
+# --- Current provider HTTP contracts ---
+
+def test_claude_sends_adaptive_thinking_contract(monkeypatch):
+    import nanocode
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "offline-test-key")
+    requests = []
+    conversation = [{"role": "user", "content": "hello"}]
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"content": [{"type": "text", "text": "hello"}],
+                    "usage": {"input_tokens": 12}}
+
+    def post(url, headers, json, timeout):
+        requests.append((url, headers, json, timeout))
+        return Response()
+
+    monkeypatch.setattr(nanocode.requests, "post", post)
+    thought = nanocode.Claude().think(conversation)
+
+    assert thought.text == "hello"
+    assert len(requests) == 1
+    url, headers, payload, timeout = requests[0]
+    assert url == "https://api.anthropic.com/v1/messages"
+    assert headers == {"x-api-key": "offline-test-key",
+                       "anthropic-version": "2023-06-01",
+                       "content-type": "application/json"}
+    assert timeout == 120
+    assert payload == {
+        "model": "claude-sonnet-5-5",
+        "max_tokens": 16000,
+        "thinking": {"type": "adaptive", "display": "summarized"},
+        "output_config": {"effort": "medium"},
+        "messages": conversation,
+    }
+    assert "budget_tokens" not in payload["thinking"]
+
+
+@pytest.mark.parametrize("thinking", ["", "Read the source before answering."])
+def test_tool_continuation_preserves_signed_and_redacted_thinking(monkeypatch, tmp_path, thinking):
+    import copy
+    import nanocode
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "offline-test-key")
+    source = tmp_path / "source.py"
+    source.write_text("preserved source\n")
+    content = [
+        {"type": "thinking", "thinking": thinking, "signature": "signed-thinking"},
+        {"type": "text", "text": "Checking the source."},
+        {"type": "redacted_thinking", "data": "opaque-thinking"},
+        {"type": "tool_use", "id": "read-1", "name": "read_file",
+         "input": {"path": str(source)}},
+    ]
+    responses = iter([content, [{"type": "text", "text": "done"}]])
+    requests = []
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, blocks):
+            self.blocks = blocks
+
+        def json(self):
+            return {"content": self.blocks, "usage": {"input_tokens": 12}}
+
+    def post(url, headers, json, timeout):
+        requests.append(copy.deepcopy(json))
+        return Response(next(responses))
+
+    monkeypatch.setattr(nanocode.requests, "post", post)
+    tools = [nanocode.ReadFile()]
+    brain = nanocode.Claude(tools=nanocode.tool_definitions(tools))
+    agent = nanocode.Agent(brain=brain, tools=tools)
+
+    assert agent.handle_input("Read the source") == "Checking the source.\ndone"
+    assert len(requests) == 2
+    assert requests[1]["messages"][1] == {"role": "assistant", "content": content}
+    assert requests[1]["messages"][2] == {
+        "role": "user", "content": [{"type": "tool_result", "tool_use_id": "read-1",
+                                      "content": "1 | preserved source\n"}]
+    }

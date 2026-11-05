@@ -15,7 +15,7 @@ No LangChain. No vector databases. No "orchestration frameworks." Just `requests
 - Search the web for current information
 - Run on Claude, DeepSeek, or local models via Ollama
 
-By the end of the book, you'll have a ~700-line Python script that rivals commercial coding assistants — and you'll understand every line because you wrote it.
+By the end of the book, you'll have a roughly 800-line Python agent you can inspect, test, and extend. It is a teaching foundation, not a filesystem or shell sandbox.
 
 ## Repository Structure
 
@@ -33,9 +33,9 @@ Each `chXX/` folder contains a complete, runnable snapshot of the code at the en
 | `ch08/` | Codebase context — list and search files |
 | `ch09/` | Feedback loop — run commands, fix errors |
 | `ch10/` | Local models — Ollama integration |
-| `ch11/` | Web search — DuckDuckGo tool |
+| `ch11/` | Web search — ddgs metasearch tool |
 | `ch12/` | Capstone — build a Snake game with AI |
-| `appendix/` | Streaming — real-time output with extended thinking |
+| `appendix/` | Streaming — real-time output with adaptive thinking |
 
 ## Quick Start
 
@@ -50,7 +50,7 @@ source venv/bin/activate  # Mac/Linux
 # venv\Scripts\activate   # Windows
 
 # Install dependencies
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 
 # Set up API key
 cp .env.example .env
@@ -82,19 +82,33 @@ Ollama must report the selected model’s active context window in `/api/ps`;
 Nanocode stops before inference if it cannot determine that window. Plan mode
 refuses act-only tools at dispatch, but is not a filesystem sandbox.
 
-The completed Snake demo and its plan are in `ch12/snake_game/`. To run the
-sample game in your active virtual environment:
+The completed Snake demo and its plan are in `ch12/snake_game/`. Run it in a
+separate environment with the edition's tested pygame-ce version:
 
 ```bash
-pip install pygame
+python3 -m venv ch12/snake_game/.venv
+source ch12/snake_game/.venv/bin/activate
+python -m pip install pygame-ce==2.5.8
 python ch12/snake_game/snake.py
 ```
 
+pygame-ce supplies `import pygame`. Do not install `pygame` and `pygame-ce`
+together in the same environment.
+
 ## Requirements
 
-- Python 3.10+
+- Python 3.15 recommended; Python 3.12 is the tested minimum
 - An Anthropic API key (get one at [console.anthropic.com](https://console.anthropic.com))
 - Optional: DeepSeek API key, Ollama for local models
+
+The examples use Claude Sonnet 5.5 and DeepSeek Flash through raw HTTP. From
+Chapter 6 onward, Claude's explicit thinking-block policy permits memory, mode,
+and compaction changes while retaining complete local history. The server may
+discard earlier reasoning repeatedly, increasing output usage or affecting
+quality; the book explains this compatibility tradeoff.
+
+The pinned dependencies and all 552 offline snapshot tests are verified on
+Python 3.12 and 3.15. Run snapshots separately because they share module names.
 
 ## Community Implementations
 

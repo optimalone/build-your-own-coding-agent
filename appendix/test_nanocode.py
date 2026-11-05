@@ -390,6 +390,41 @@ def test_stream_response_complete_text_and_tool(stream_brain, capsys):
     assert capsys.readouterr().out == "Reading now.\n"
 
 
+@pytest.mark.parametrize("start_usage, updates, expected", [
+    ({"input_tokens": 0}, [
+        {"input_tokens": 100, "cache_read_input_tokens": 700,
+         "cache_creation_input_tokens": 200, "output_tokens": 20},
+    ], 1000),
+    ({"input_tokens": 100, "cache_read_input_tokens": 700,
+      "cache_creation_input_tokens": 200}, [
+        {"input_tokens": 100, "cache_read_input_tokens": 700,
+         "cache_creation_input_tokens": 200, "output_tokens": 10},
+        {"input_tokens": 100, "cache_read_input_tokens": 700,
+         "cache_creation_input_tokens": 200, "output_tokens": 20},
+    ], 1000),
+    ({"input_tokens": 100, "cache_read_input_tokens": 700,
+      "cache_creation_input_tokens": 200}, [{"output_tokens": 20}], 1000),
+    (None, [None], 0),
+], ids=["final_input", "cumulative_updates", "output_only_update", "absent_usage"])
+def test_stream_response_merges_cumulative_input_usage(stream_brain, start_usage, updates, expected):
+    start = stream_start()
+    if start_usage is None:
+        del start["message"]["usage"]
+    else:
+        start["message"]["usage"] = start_usage
+    deltas = []
+    for usage in updates:
+        delta = {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}}
+        if usage is not None:
+            delta["usage"] = usage
+        deltas.append(delta)
+
+    brain, thought = stream_brain([start, *text_events(), *deltas, {"type": "message_stop"}])
+
+    assert thought.text == "Reading now."
+    assert brain.last_input_tokens == expected
+
+
 @pytest.mark.parametrize("thinking", ["Check the file.", ""], ids=["visible", "omitted"])
 def test_stream_response_preserves_signed_and_redacted_thinking_order(stream_brain, thinking):
     events = [
@@ -475,15 +510,94 @@ def test_deepseek_sends_supported_model_with_thinking_disabled(monkeypatch):
     def post(url, headers, json, stream, timeout):
         assert stream is True
         assert url == "https://api.deepseek.com/anthropic/v1/messages"
+        assert headers == {"x-api-key": "offline-test-key", "anthropic-version": "2023-06-01",
+                           "content-type": "application/json"}
+        assert timeout == 120
         payloads.append(json)
         return Response()
 
     monkeypatch.setattr(nanocode.requests, "post", post)
-    thought = nanocode.DeepSeek().think([{"role": "user", "content": "hello"}])
+    brain = nanocode.DeepSeek()
+    thought = brain.think([{"role": "user", "content": "hello"}])
 
+    assert brain.context_limit == 1_000_000
     assert thought.text == "hello"
-    assert payloads[0]["model"] == "deepseek-v4-pro"
+    assert payloads[0]["model"] == "deepseek-flash"
     assert payloads[0]["thinking"] == {"type": "disabled"}
+    assert payloads[0]["max_tokens"] == 4096
+    assert payloads[0]["stream"] is True
+    assert payloads[0]["messages"] == [{"role": "user", "content": "hello"}]
+
+
+def test_claude_stream_continuation_preserves_empty_signed_thinking(monkeypatch, tmp_path):
+    import nanocode
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "offline-test-key")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "main.py").write_text("print('hello')")
+    streams = iter([
+        [stream_start(),
+         {"type": "content_block_start", "index": 0,
+          "content_block": {"type": "thinking", "thinking": ""}},
+         {"type": "content_block_delta", "index": 0,
+          "delta": {"type": "signature_delta", "signature": "opaque+/"}},
+         {"type": "content_block_delta", "index": 0,
+          "delta": {"type": "signature_delta", "signature": "signature=="}},
+         {"type": "content_block_stop", "index": 0},
+         *text_events(1), *tool_events(2), *stream_end()],
+        [stream_start(), *text_events(), *stream_end()],
+    ])
+    requests_sent = []
+
+    class Response:
+        status_code = 200
+        headers = {}
+
+        def __init__(self, events):
+            self.events = events
+
+        def iter_lines(self):
+            for event in self.events:
+                yield ("data: " + json.dumps(event)).encode()
+
+    def post(url, headers, json, stream, timeout):
+        assert url == "https://api.anthropic.com/v1/messages"
+        assert headers == {"x-api-key": "offline-test-key", "anthropic-version": "2023-06-01",
+                           "anthropic-beta": "thinking-binding-controls-2026-08-01",
+                           "content-type": "application/json"}
+        assert stream is True
+        assert timeout == 120
+        requests_sent.append(__import__("copy").deepcopy(json))
+        return Response(next(streams))
+
+    monkeypatch.setattr(nanocode.requests, "post", post)
+    brain = nanocode.Claude()
+    agent = Agent(brain=brain, tools=tools, mode="plan")
+
+    agent.handle_input("Read main.py")
+
+    assert len(requests_sent) == 2
+    continued = requests_sent[1]["messages"]
+    assert continued[1]["content"] == [
+        {"type": "thinking", "thinking": "", "signature": "opaque+/signature=="},
+        {"type": "text", "text": "Reading now."},
+        {"type": "tool_use", "id": "tool_1", "name": "read_file", "input": {"path": "main.py"}},
+    ]
+    assert continued[1]["content"][0]["signature"].encode() == b"opaque+/signature=="
+    assert continued[2]["content"][0]["tool_use_id"] == "tool_1"
+    assert "print('hello')" in continued[2]["content"][0]["content"]
+    for payload in requests_sent:
+        assert payload["model"] == "claude-sonnet-5-5"
+        assert payload["thinking"] == {
+            "type": "adaptive", "display": "summarized",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+        }
+        assert payload["output_config"] == {"effort": "medium"}
+        assert payload["max_tokens"] == 16000
+        assert payload["stream"] is True
+        assert payload["tools"] == brain.tools
+        assert payload["system"] == brain.system
+    assert brain.context_limit == 1_000_000
 
 
 def test_plan_dispatch_refuses_write_requested_by_brain(tmp_path):
@@ -983,3 +1097,187 @@ def test_run_command_timeout_warns_user_and_discourages_automatic_retry(monkeypa
     assert "child processes may still be running" in capsys.readouterr().out.lower()
     assert "timed out" in result.lower()
     assert "do not retry automatically" in result.lower()
+
+
+# --- Signed-prefix transition HTTP regressions ---
+
+def prefix_transition_http(monkeypatch, responses):
+    """Keep Agent/provider parsing real; replace only the external HTTP boundary."""
+    import copy
+    import json as json_module
+    import nanocode
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "offline-test-key")
+    replies = iter(responses)
+    sent = []
+
+    class Response:
+        status_code = 200
+        headers = {}
+
+        def __init__(self, content, input_tokens):
+            self.content = content
+            self.input_tokens = input_tokens
+
+        def json(self):
+            return {"content": self.content, "usage": {"input_tokens": self.input_tokens}}
+
+        def iter_lines(self):
+            events = [{"type": "message_start", "message": {
+                "usage": {"input_tokens": self.input_tokens}}}]
+            for index, block in enumerate(self.content):
+                # Emit signed thinking through deltas, including an empty signed block.
+                start = dict(block)
+                signature = start.pop("signature", None)
+                if block["type"] == "tool_use":
+                    start["input"] = {}
+                if block["type"] in ("text", "thinking"):
+                    field = "text" if block["type"] == "text" else "thinking"
+                    start[field] = ""
+                events.append({"type": "content_block_start", "index": index,
+                               "content_block": start})
+                if block["type"] in ("text", "thinking"):
+                    events.append({"type": "content_block_delta", "index": index,
+                                   "delta": {"type": field + "_delta", field: block[field]}})
+                if block["type"] == "tool_use":
+                    events.append({"type": "content_block_delta", "index": index,
+                                   "delta": {"type": "input_json_delta",
+                                             "partial_json": json_module.dumps(block["input"])}})
+                if signature is not None:
+                    events.append({"type": "content_block_delta", "index": index,
+                                   "delta": {"type": "signature_delta", "signature": signature}})
+                events.append({"type": "content_block_stop", "index": index})
+            events.append({"type": "message_stop"})
+            for event in events:
+                yield ("data: " + json_module.dumps(event)).encode()
+
+    def post(url, headers, json, timeout, **kwargs):
+        assert url == "https://api.anthropic.com/v1/messages"
+        assert timeout == 120
+        assert kwargs == {"stream": True}
+        sent.append((copy.deepcopy(headers), copy.deepcopy(json)))
+        return Response(*next(replies))
+
+    monkeypatch.setattr(nanocode.requests, "post", post)
+    return sent
+
+
+def signed_prefix_blocks():
+    return [
+        {"type": "thinking", "thinking": "", "signature": "empty+/signature=="},
+        {"type": "redacted_thinking", "data": "opaque-redacted"},
+        {"type": "thinking", "thinking": "Keep the context.", "signature": "signed+/block=="},
+    ]
+
+
+def assert_prefix_drop_contract(sent):
+    for headers, payload in sent:
+        assert headers == {
+            "x-api-key": "offline-test-key",
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "thinking-binding-controls-2026-08-01",
+            "content-type": "application/json",
+        }
+        assert payload["thinking"] == {
+            "type": "adaptive", "display": "summarized",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+        }
+        assert payload["model"] == "claude-sonnet-5-5"
+        assert payload["max_tokens"] == 16000
+        assert payload["output_config"] == {"effort": "medium"}
+
+
+def test_signed_prefix_memory_refresh_http(monkeypatch, tmp_path):
+    import nanocode
+
+    memory = nanocode.Memory(path=str(tmp_path / "memory.md"))
+    memory.save("Original preferences")
+    content = signed_prefix_blocks() + [{
+        "type": "tool_use", "id": "save-1", "name": "save_memory",
+        "input": {"content": "Updated preferences"},
+    }]
+    sent = prefix_transition_http(monkeypatch, [
+        (content, 12), ([{"type": "text", "text": "done"}], 15),
+    ])
+    agent = nanocode.Agent(brain=nanocode.Claude(memory=memory),
+                           tools=[nanocode.SaveMemory()], memory=memory)
+
+    agent.handle_input("Remember my preferences")
+
+    assert len(sent) == 2
+    assert "Original preferences" in sent[0][1]["system"]
+    assert "Updated preferences" in sent[1][1]["system"]
+    continued = sent[1][1]["messages"]
+    assert continued[1] == {"role": "assistant", "content": content}
+    assert agent.conversation[1]["content"] == content
+    assert continued[2]["content"] == [{"type": "tool_result", "tool_use_id": "save-1",
+                                         "content": "Memory updated successfully."}]
+    assert memory.content == "Updated preferences"
+    assert_prefix_drop_contract(sent)
+
+
+def test_signed_prefix_mode_switch_http(monkeypatch, tmp_path):
+    import nanocode
+
+    forbidden = tmp_path / "forbidden.py"
+    signed = signed_prefix_blocks() + [{"type": "text", "text": "ready"}]
+    blocked = [{"type": "tool_use", "id": "write-1", "name": "write_file",
+                "input": {"path": str(forbidden), "content": "unsafe"}}]
+    sent = prefix_transition_http(monkeypatch, [
+        (signed, 12), (blocked, 15), ([{"type": "text", "text": "done"}], 18),
+    ])
+    agent = nanocode.Agent(brain=nanocode.Claude(),
+                           tools=[nanocode.ReadFile(), nanocode.WriteFile()], mode="act")
+
+    agent.handle_input("Get ready")
+    agent.handle_input("/mode plan")
+    agent.handle_input("Try the write")
+
+    assert len(sent) == 3
+    assert "system" not in sent[0][1]
+    assert "PLAN mode" in sent[1][1]["system"]
+    assert [t["name"] for t in sent[0][1]["tools"]] == ["read_file", "write_file"]
+    assert [t["name"] for t in sent[1][1]["tools"]] == ["read_file"]
+    assert sent[1][1]["messages"][1] == {"role": "assistant", "content": signed}
+    assert agent.conversation[1]["content"] == signed
+    assert sent[2][1]["messages"][3] == {"role": "assistant", "content": blocked}
+    assert sent[2][1]["messages"][4]["content"] == [{
+        "type": "tool_result", "tool_use_id": "write-1",
+        "content": "Error: Tool 'write_file' is not allowed in plan mode",
+    }]
+    assert not forbidden.exists()
+    assert_prefix_drop_contract(sent)
+
+
+def test_signed_prefix_compaction_tool_continuation_http(monkeypatch, tmp_path):
+    import nanocode
+
+    source = tmp_path / "source.py"
+    source.write_text("source evidence\n")
+    older = signed_prefix_blocks() + [{"type": "text", "text": "ready"}]
+    content = signed_prefix_blocks() + [{
+        "type": "tool_use", "id": "read-1", "name": "read_file",
+        "input": {"path": str(source)},
+    }]
+    sent = prefix_transition_http(monkeypatch, [
+        (older, 12), (content, 800_000),
+        ([{"type": "text", "text": "Short summary"}], 20),
+        ([{"type": "text", "text": "done"}], 25),
+    ])
+    agent = nanocode.Agent(brain=nanocode.Claude(), tools=[nanocode.ReadFile()])
+
+    agent.handle_input("Prepare to read")
+    agent.handle_input("Read the source")
+
+    assert len(sent) == 4
+    assert sent[1][1]["messages"][1]["content"] == older
+    assert "Summarize this conversation" in sent[2][1]["messages"][0]["content"]
+    assert "tools" not in sent[2][1]
+    continued = sent[3][1]["messages"]
+    assert continued[0] == {"role": "user", "content": "Previous conversation summary: Short summary"}
+    assert continued[1] == {"role": "assistant", "content": content}
+    assert agent.conversation[1]["content"] == content
+    assert continued[2]["content"] == [{"type": "tool_result", "tool_use_id": "read-1",
+                                         "content": "1 | source evidence\n"}]
+    assert [t["name"] for t in sent[3][1]["tools"]] == ["read_file"]
+    assert_prefix_drop_contract(sent)

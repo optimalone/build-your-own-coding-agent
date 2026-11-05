@@ -141,3 +141,47 @@ def test_tool_call_stores_attributes():
     assert call.name == "write_file"
     assert call.args["path"] == "x.txt"
     assert call.args["content"] == "hi"
+
+
+# --- Current provider HTTP contracts ---
+
+def test_claude_sends_adaptive_thinking_contract(monkeypatch):
+    import nanocode
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "offline-test-key")
+    requests = []
+    conversation = [{"role": "user", "content": "hello"}]
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"content": [{"type": "text", "text": "hello"}],
+                    "usage": {"input_tokens": 12}}
+
+    def post(url, headers, json, timeout):
+        requests.append((url, headers, json, timeout))
+        return Response()
+
+    monkeypatch.setattr(nanocode.requests, "post", post)
+    thought = nanocode.Claude().think(conversation)
+
+    assert thought.text == "hello"
+    assert len(requests) == 1
+    url, headers, payload, timeout = requests[0]
+    assert url == "https://api.anthropic.com/v1/messages"
+    assert headers == {"x-api-key": "offline-test-key",
+                       "anthropic-version": "2023-06-01",
+                       "content-type": "application/json"}
+    assert timeout == 120
+    assert payload == {
+        "model": "claude-sonnet-5-5",
+        "max_tokens": 16000,
+        "thinking": {"type": "adaptive", "display": "summarized"},
+        "output_config": {"effort": "medium"},
+        "messages": conversation,
+    }
+    assert "budget_tokens" not in payload["thinking"]

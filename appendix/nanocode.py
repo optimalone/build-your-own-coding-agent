@@ -85,12 +85,19 @@ class ToolContext:
 
 class Brain:
     """Base class for LLM providers."""
-    context_limit = 200_000  # Subclasses override as needed
+    context_limit = 1_000_000  # Subclasses override as needed
     last_input_tokens = 0    # Updated after each think() call
 
     def think(self, conversation):
         """Process conversation, return Thought."""
         raise NotImplementedError
+
+    @staticmethod
+    def _input_token_count(usage):
+        """Count ordinary and cached input tokens occupying the context."""
+        return sum(usage.get(field, 0) for field in (
+            "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"
+        ))
 
     def _stream_response(self, url, headers, payload, max_retries=10):
         """Stream an API response, printing tokens as they arrive."""
@@ -130,7 +137,7 @@ class Brain:
         tool_calls = []
         current_tool = None
         current_index = 0
-        input_tokens = 0
+        usage = {}
         has_text = False
         open_blocks = set()
         message_complete = False
@@ -149,7 +156,10 @@ class Brain:
             event_type = data.get("type")
 
             if event_type == "message_start":
-                input_tokens = data.get("message", {}).get("usage", {}).get("input_tokens", 0)
+                usage = dict(data.get("message", {}).get("usage", {}))
+
+            elif event_type == "message_delta":
+                usage.update(data.get("usage", {}))
 
             elif event_type == "error":
                 error = data.get("error", {})
@@ -215,7 +225,7 @@ class Brain:
         if not message_complete:
             raise Exception("Stream error: Missing message_stop; response is incomplete")
 
-        self.last_input_tokens = input_tokens
+        self.last_input_tokens = self._input_token_count(usage)
 
         # Build raw_content in index order (matches API's content array)
         raw_content = []
@@ -261,22 +271,25 @@ class Claude(Brain):
         self.api_key = os.getenv("ANTHROPIC_API_KEY")
         if not self.api_key:
             raise ValueError("ANTHROPIC_API_KEY not found in .env")
-        self.model = "claude-sonnet-4-6"
+        self.model = "claude-sonnet-5-5"
         self.url = "https://api.anthropic.com/v1/messages"
 
     def think(self, conversation):
         headers = {
             "x-api-key": self.api_key,
             "anthropic-version": "2023-06-01",
+            "anthropic-beta": "thinking-binding-controls-2026-08-01",
             "content-type": "application/json"
         }
         payload = {
             "model": self.model,
             "max_tokens": 16000,
             "thinking": {
-                "type": "enabled",
-                "budget_tokens": 10000
+                "type": "adaptive",
+                "display": "summarized",
+                "block_binding": {"prefix_mismatch_behavior": "drop_block"},
             },
+            "output_config": {"effort": "medium"},
             "messages": conversation,
             "stream": True,
         }
@@ -290,7 +303,7 @@ class Claude(Brain):
 
 class DeepSeek(Brain):
     """DeepSeek API (Anthropic-compatible, with tool support)."""
-    context_limit = 128_000
+    context_limit = 1_000_000
 
     def __init__(self, memory=None, tools=None):
         self.memory = memory
@@ -299,7 +312,7 @@ class DeepSeek(Brain):
         self.api_key = os.getenv("DEEPSEEK_API_KEY")
         if not self.api_key:
             raise ValueError("DEEPSEEK_API_KEY not found in .env")
-        self.model = "deepseek-v4-pro"
+        self.model = "deepseek-flash"
         self.url = "https://api.deepseek.com/anthropic/v1/messages"
 
     def think(self, conversation):
@@ -655,7 +668,7 @@ class RunCommand:
 
 
 class SearchWeb:
-    """Searches the internet using DuckDuckGo."""
+    """Searches the internet using ddgs metasearch."""
     name = "search_web"
     plan_safe = True
     description = "Searches the internet for current information. Use when you need knowledge beyond your training data."
@@ -670,7 +683,7 @@ class SearchWeb:
     def execute(self, context, query):
         print(f"  → Searching web for '{query}'")
         if DDGS is None:
-            return "Error: ddgs package not installed. Run: pip install ddgs"
+            return "Error: ddgs package not installed. Run: python -m pip install ddgs==9.16.1"
         try:
             results = DDGS().text(query, max_results=3)
             if not results:

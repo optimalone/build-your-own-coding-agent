@@ -204,6 +204,8 @@ def test_deepseek_sends_supported_model_with_thinking_disabled(monkeypatch):
 
     def post(url, headers, json, timeout):
         assert url == "https://api.deepseek.com/anthropic/v1/messages"
+        assert headers["x-api-key"] == "offline-test-key"
+        assert timeout == 120
         payloads.append(json)
         return Response()
 
@@ -211,8 +213,10 @@ def test_deepseek_sends_supported_model_with_thinking_disabled(monkeypatch):
     thought = nanocode.DeepSeek().think([{"role": "user", "content": "hello"}])
 
     assert thought.text == "hello"
-    assert payloads[0]["model"] == "deepseek-v4-pro"
+    assert payloads[0]["model"] == "deepseek-flash"
     assert payloads[0]["thinking"] == {"type": "disabled"}
+    assert payloads[0]["max_tokens"] == 4096
+    assert payloads[0]["messages"] == [{"role": "user", "content": "hello"}]
 
 
 def test_plan_dispatch_refuses_write_requested_by_brain(tmp_path):
@@ -388,3 +392,214 @@ def test_tool_exception_returns_results_for_all_calls_and_session_continues(tmp_
     agent.handle_input("Continue")
     assert agent.conversation[-1]["content"] == [{"type": "text", "text": "Continued"}]
     assert_tool_results_follow_requests(agent.conversation)
+
+
+# --- Current provider HTTP contracts ---
+
+def test_claude_sends_adaptive_thinking_contract(monkeypatch):
+    import nanocode
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "offline-test-key")
+    requests = []
+    conversation = [{"role": "user", "content": "hello"}]
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"content": [{"type": "text", "text": "hello"}],
+                    "usage": {"input_tokens": 12}}
+
+    def post(url, headers, json, timeout):
+        requests.append((url, headers, json, timeout))
+        return Response()
+
+    monkeypatch.setattr(nanocode.requests, "post", post)
+    thought = nanocode.Claude().think(conversation)
+
+    assert thought.text == "hello"
+    assert len(requests) == 1
+    url, headers, payload, timeout = requests[0]
+    assert url == "https://api.anthropic.com/v1/messages"
+    assert headers == {"x-api-key": "offline-test-key",
+                       "anthropic-version": "2023-06-01",
+                       "anthropic-beta": "thinking-binding-controls-2026-08-01",
+                       "content-type": "application/json"}
+    assert timeout == 120
+    assert payload == {
+        "model": "claude-sonnet-5-5",
+        "max_tokens": 16000,
+        "thinking": {"type": "adaptive", "display": "summarized",
+                     "block_binding": {"prefix_mismatch_behavior": "drop_block"}},
+        "output_config": {"effort": "medium"},
+        "messages": conversation,
+    }
+    assert "budget_tokens" not in payload["thinking"]
+
+
+@pytest.mark.parametrize("thinking", ["", "Read the source before answering."])
+def test_tool_continuation_preserves_signed_and_redacted_thinking(monkeypatch, tmp_path, thinking):
+    import copy
+    import nanocode
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "offline-test-key")
+    source = tmp_path / "source.py"
+    source.write_text("preserved source\n")
+    content = [
+        {"type": "thinking", "thinking": thinking, "signature": "signed-thinking"},
+        {"type": "text", "text": "Checking the source."},
+        {"type": "redacted_thinking", "data": "opaque-thinking"},
+        {"type": "tool_use", "id": "read-1", "name": "read_file",
+         "input": {"path": str(source)}},
+    ]
+    responses = iter([content, [{"type": "text", "text": "done"}]])
+    requests = []
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, blocks):
+            self.blocks = blocks
+
+        def json(self):
+            return {"content": self.blocks, "usage": {"input_tokens": 12}}
+
+    def post(url, headers, json, timeout):
+        requests.append(copy.deepcopy(json))
+        return Response(next(responses))
+
+    monkeypatch.setattr(nanocode.requests, "post", post)
+    tools = [nanocode.ReadFile()]
+    brain = nanocode.Claude(tools=nanocode.tool_definitions(tools))
+    agent = nanocode.Agent(brain=brain, tools=tools)
+
+    assert agent.handle_input("Read the source") == "Checking the source.\ndone"
+    assert len(requests) == 2
+    assert requests[1]["messages"][1] == {"role": "assistant", "content": content}
+    assert requests[1]["messages"][2] == {
+        "role": "user", "content": [{"type": "tool_result", "tool_use_id": "read-1",
+                                      "content": "1 | preserved source\n"}]
+    }
+
+
+# --- Signed-prefix transition HTTP regressions ---
+
+def prefix_transition_http(monkeypatch, responses):
+    """Keep Agent/provider parsing real; replace only the external HTTP boundary."""
+    import copy
+    import json as json_module
+    import nanocode
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "offline-test-key")
+    replies = iter(responses)
+    sent = []
+
+    class Response:
+        status_code = 200
+        headers = {}
+
+        def __init__(self, content, input_tokens):
+            self.content = content
+            self.input_tokens = input_tokens
+
+        def json(self):
+            return {"content": self.content, "usage": {"input_tokens": self.input_tokens}}
+
+    def post(url, headers, json, timeout, **kwargs):
+        assert url == "https://api.anthropic.com/v1/messages"
+        assert timeout == 120
+        sent.append((copy.deepcopy(headers), copy.deepcopy(json)))
+        return Response(*next(replies))
+
+    monkeypatch.setattr(nanocode.requests, "post", post)
+    return sent
+
+
+def signed_prefix_blocks():
+    return [
+        {"type": "thinking", "thinking": "", "signature": "empty+/signature=="},
+        {"type": "redacted_thinking", "data": "opaque-redacted"},
+        {"type": "thinking", "thinking": "Keep the context.", "signature": "signed+/block=="},
+    ]
+
+
+def assert_prefix_drop_contract(sent):
+    for headers, payload in sent:
+        assert headers == {
+            "x-api-key": "offline-test-key",
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "thinking-binding-controls-2026-08-01",
+            "content-type": "application/json",
+        }
+        assert payload["thinking"] == {
+            "type": "adaptive", "display": "summarized",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+        }
+        assert payload["model"] == "claude-sonnet-5-5"
+        assert payload["max_tokens"] == 16000
+        assert payload["output_config"] == {"effort": "medium"}
+
+
+def test_signed_prefix_memory_refresh_http(monkeypatch, tmp_path):
+    import nanocode
+
+    memory = nanocode.Memory(path=str(tmp_path / "memory.md"))
+    memory.save("Original preferences")
+    content = signed_prefix_blocks() + [{
+        "type": "tool_use", "id": "save-1", "name": "save_memory",
+        "input": {"content": "Updated preferences"},
+    }]
+    sent = prefix_transition_http(monkeypatch, [
+        (content, 12), ([{"type": "text", "text": "done"}], 15),
+    ])
+    agent = nanocode.Agent(brain=nanocode.Claude(memory=memory),
+                           tools=[nanocode.SaveMemory()], memory=memory)
+
+    agent.handle_input("Remember my preferences")
+
+    assert len(sent) == 2
+    assert "Original preferences" in sent[0][1]["system"]
+    assert "Updated preferences" in sent[1][1]["system"]
+    continued = sent[1][1]["messages"]
+    assert continued[1] == {"role": "assistant", "content": content}
+    assert agent.conversation[1]["content"] == content
+    assert continued[2]["content"] == [{"type": "tool_result", "tool_use_id": "save-1",
+                                         "content": "Memory updated successfully."}]
+    assert memory.content == "Updated preferences"
+    assert_prefix_drop_contract(sent)
+
+
+def test_signed_prefix_mode_switch_http(monkeypatch, tmp_path):
+    import nanocode
+
+    forbidden = tmp_path / "forbidden.py"
+    signed = signed_prefix_blocks() + [{"type": "text", "text": "ready"}]
+    blocked = [{"type": "tool_use", "id": "write-1", "name": "write_file",
+                "input": {"path": str(forbidden), "content": "unsafe"}}]
+    sent = prefix_transition_http(monkeypatch, [
+        (signed, 12), (blocked, 15), ([{"type": "text", "text": "done"}], 18),
+    ])
+    agent = nanocode.Agent(brain=nanocode.Claude(),
+                           tools=[nanocode.ReadFile(), nanocode.WriteFile()], mode="act")
+
+    agent.handle_input("Get ready")
+    agent.handle_input("/mode plan")
+    agent.handle_input("Try the write")
+
+    assert len(sent) == 3
+    assert "system" not in sent[0][1]
+    assert "PLAN mode" in sent[1][1]["system"]
+    assert [t["name"] for t in sent[0][1]["tools"]] == ["read_file", "write_file"]
+    assert [t["name"] for t in sent[1][1]["tools"]] == ["read_file"]
+    assert sent[1][1]["messages"][1] == {"role": "assistant", "content": signed}
+    assert agent.conversation[1]["content"] == signed
+    assert sent[2][1]["messages"][3] == {"role": "assistant", "content": blocked}
+    assert sent[2][1]["messages"][4]["content"] == [{
+        "type": "tool_result", "tool_use_id": "write-1",
+        "content": "Error: Tool 'write_file' is not allowed in plan mode",
+    }]
+    assert not forbidden.exists()
+    assert_prefix_drop_contract(sent)

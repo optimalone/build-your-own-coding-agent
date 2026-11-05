@@ -154,22 +154,25 @@ class Claude(Brain):
         self.api_key = os.getenv("ANTHROPIC_API_KEY")
         if not self.api_key:
             raise ValueError("ANTHROPIC_API_KEY not found in .env")
-        self.model = "claude-sonnet-4-6"
+        self.model = "claude-sonnet-5-5"
         self.url = "https://api.anthropic.com/v1/messages"
 
     def think(self, conversation):
         headers = {
             "x-api-key": self.api_key,
             "anthropic-version": "2023-06-01",
+            "anthropic-beta": "thinking-binding-controls-2026-08-01",
             "content-type": "application/json"
         }
         payload = {
             "model": self.model,
             "max_tokens": 16000,
             "thinking": {
-                "type": "enabled",
-                "budget_tokens": 10000
+                "type": "adaptive",
+                "display": "summarized",
+                "block_binding": {"prefix_mismatch_behavior": "drop_block"},
             },
+            "output_config": {"effort": "medium"},
             "messages": conversation
         }
         if self.system:
@@ -191,7 +194,7 @@ class DeepSeek(Brain):
         self.api_key = os.getenv("DEEPSEEK_API_KEY")
         if not self.api_key:
             raise ValueError("DEEPSEEK_API_KEY not found in .env")
-        self.model = "deepseek-v4-pro"
+        self.model = "deepseek-flash"
         self.url = "https://api.deepseek.com/anthropic/v1/messages"
 
     def think(self, conversation):

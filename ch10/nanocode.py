@@ -114,12 +114,19 @@ class ToolContext:
 
 class Brain:
     """Base class for LLM providers."""
-    context_limit = 200_000  # Subclasses override as needed
+    context_limit = 1_000_000  # Subclasses override as needed
     last_input_tokens = 0    # Updated after each think() call
 
     def think(self, conversation):
         """Process conversation, return Thought."""
         raise NotImplementedError
+
+    @staticmethod
+    def _input_token_count(usage):
+        """Count ordinary and cached input tokens occupying the context."""
+        return sum(usage.get(field, 0) for field in (
+            "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"
+        ))
 
     def _parse_response(self, content):
         """Convert API response format to Thought."""
@@ -157,22 +164,25 @@ class Claude(Brain):
         self.api_key = os.getenv("ANTHROPIC_API_KEY")
         if not self.api_key:
             raise ValueError("ANTHROPIC_API_KEY not found in .env")
-        self.model = "claude-sonnet-4-6"
+        self.model = "claude-sonnet-5-5"
         self.url = "https://api.anthropic.com/v1/messages"
 
     def think(self, conversation):
         headers = {
             "x-api-key": self.api_key,
             "anthropic-version": "2023-06-01",
+            "anthropic-beta": "thinking-binding-controls-2026-08-01",
             "content-type": "application/json"
         }
         payload = {
             "model": self.model,
             "max_tokens": 16000,
             "thinking": {
-                "type": "enabled",
-                "budget_tokens": 10000
+                "type": "adaptive",
+                "display": "summarized",
+                "block_binding": {"prefix_mismatch_behavior": "drop_block"},
             },
+            "output_config": {"effort": "medium"},
             "messages": conversation
         }
         if self.system:
@@ -182,13 +192,13 @@ class Claude(Brain):
 
         response = request_with_retry(self.url, headers, payload)
         data = response.json()
-        self.last_input_tokens = data.get("usage", {}).get("input_tokens", 0)
+        self.last_input_tokens = self._input_token_count(data.get("usage", {}))
         return self._parse_response(data["content"])
 
 
 class DeepSeek(Brain):
     """DeepSeek API (Anthropic-compatible, with tool support)."""
-    context_limit = 128_000
+    context_limit = 1_000_000
 
     def __init__(self, memory=None, tools=None):
         self.memory = memory
@@ -197,7 +207,7 @@ class DeepSeek(Brain):
         self.api_key = os.getenv("DEEPSEEK_API_KEY")
         if not self.api_key:
             raise ValueError("DEEPSEEK_API_KEY not found in .env")
-        self.model = "deepseek-v4-pro"
+        self.model = "deepseek-flash"
         self.url = "https://api.deepseek.com/anthropic/v1/messages"
 
     def think(self, conversation):
@@ -219,7 +229,7 @@ class DeepSeek(Brain):
 
         response = request_with_retry(self.url, headers, payload)
         data = response.json()
-        self.last_input_tokens = data.get("usage", {}).get("input_tokens", 0)
+        self.last_input_tokens = self._input_token_count(data.get("usage", {}))
         return self._parse_response(data["content"])
 
 
@@ -305,7 +315,7 @@ class Ollama(Brain):
 
         response = request_with_retry(self.url, headers, payload)
         data = response.json()
-        self.last_input_tokens = data.get("usage", {}).get("input_tokens", 0)
+        self.last_input_tokens = self._input_token_count(data.get("usage", {}))
         return self._parse_response(data["content"])
 
 
