@@ -41,7 +41,7 @@ Each `chXX/` folder contains a complete, runnable snapshot of the code at the en
 
 ```bash
 # Clone the repo
-git clone https://github.com/owenthereal/build-your-own-coding-agent.git
+git clone https://github.com/optimalone/build-your-own-coding-agent.git
 cd build-your-own-coding-agent
 
 # Create virtual environment
@@ -81,6 +81,14 @@ pytest
 Ollama must report the selected model’s active context window in `/api/ps`;
 Nanocode stops before inference if it cannot determine that window. Plan mode
 refuses act-only tools at dispatch, but is not a filesystem sandbox.
+
+The completed Snake demo and its plan are in `ch12/snake_game/`. To run the
+sample game in your active virtual environment:
+
+```bash
+pip install pygame
+python ch12/snake_game/snake.py
+```
 
 ## Requirements
 
